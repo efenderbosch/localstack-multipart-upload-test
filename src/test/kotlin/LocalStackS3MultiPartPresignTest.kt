@@ -6,11 +6,16 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
 import software.amazon.awssdk.services.s3.S3Client
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest
 import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload
 import software.amazon.awssdk.services.s3.model.CompletedPart
 import software.amazon.awssdk.services.s3.model.CreateBucketRequest
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest
+import software.amazon.awssdk.services.s3.model.DeleteObjectRequest
+import software.amazon.awssdk.services.s3.model.GetObjectTaggingRequest
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest
+import software.amazon.awssdk.services.s3.model.ListMultipartUploadsRequest
 import software.amazon.awssdk.services.s3.model.Tag
 import software.amazon.awssdk.services.s3.model.Tagging
 import software.amazon.awssdk.services.s3.model.UploadPartRequest
@@ -64,14 +69,18 @@ internal class LocalStackS3MultiPartPresignTest {
                 .build()
                 .let { s3Client.headObject(it) }
 
-            val tags = s3Client.getObjectTagging { builder ->
-                builder.bucket(bucketName).key(key).build()
-            }.tagSet()
+            val tags = GetObjectTaggingRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build()
+                .let { s3Client.getObjectTagging(it) }
+                .tagSet()
+
             val tagPresent = tags.any { tag -> tag.key() == "key" && tag.value() == "value" }
 
             assertAll(
                 { assertTrue(headObjectResponse.contentLength() == 12582912L) { "content-length" } },
-                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { " content-type" } },
+                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { "content-type" } },
                 // this assertion fails using localstack:0.12.7, but succeeds for real S3
                 { assertTrue(tagPresent, "tags should include 'key=value'; found: $tags") }
             )
@@ -107,21 +116,24 @@ internal class LocalStackS3MultiPartPresignTest {
         try {
             val eTags = uploadPartsUsingPresignedUrls(presignedUrls)
             completeMultiPartUpload(uploadId, eTags, s3Client)
-            val headObjectResponse = HeadObjectRequest
-                .builder()
+            val headObjectResponse = HeadObjectRequest.builder()
                 .bucket(bucketName)
                 .key(key)
                 .build()
                 .let { s3Client.headObject(it) }
 
-            val tags = s3Client.getObjectTagging { builder ->
-                builder.bucket(bucketName).key(key).build()
-            }.tagSet()
+            val tags = GetObjectTaggingRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .build()
+                .let { s3Client.getObjectTagging(it) }
+                .tagSet()
+
             val tagPresent = tags.any { tag -> tag.key() == "key" && tag.value() == "value" }
 
             assertAll(
                 { assertTrue(headObjectResponse.contentLength() == 12582912L) { "content-length" } },
-                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { " content-type" } },
+                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { "content-type" } },
                 { assertTrue(tagPresent, "tags should include 'key=value'; found: $tags") }
             )
         } finally {
@@ -150,12 +162,12 @@ internal class LocalStackS3MultiPartPresignTest {
                 .uploadId(uploadId)
                 .build()
 
-            val presignRequest = UploadPartPresignRequest.builder()
+            val presignedUploadPartRequest = UploadPartPresignRequest.builder()
                 .signatureDuration(Duration.ofMinutes(15))
                 .uploadPartRequest(uploadPartRequest)
                 .build()
+                .let { s3Presigner.presignUploadPart(it) }
 
-            val presignedUploadPartRequest = s3Presigner.presignUploadPart(presignRequest)
             logger.info("presigned url: {}", presignedUploadPartRequest.url())
             logger.info("signed headers: {}", presignedUploadPartRequest.signedHeaders())
             presignedUploadPartRequest.url()
@@ -177,11 +189,8 @@ internal class LocalStackS3MultiPartPresignTest {
         val partTwoByteArray = ByteArray(partTwoSize)
         file.read(partTwoByteArray)
 
-        val partOneUrl = presignedUrls[0]
-        val partTwoUrl = presignedUrls[1]
-
-        val partOneEtag = sendPart(partOneUrl, partOneByteArray)
-        val partTwoEtag = sendPart(partTwoUrl, partTwoByteArray)
+        val partOneEtag = sendPart(presignedUrls[0], partOneByteArray)
+        val partTwoEtag = sendPart(presignedUrls[1], partTwoByteArray)
         return mapOf(1 to partOneEtag, 2 to partTwoEtag)
     }
 
@@ -210,31 +219,39 @@ internal class LocalStackS3MultiPartPresignTest {
             }.let { parts ->
                 CompletedMultipartUpload.builder().parts(parts).build()
             }
-        s3Client.completeMultipartUpload { completeMultiPartUploadRequestBuilder ->
-            completeMultiPartUploadRequestBuilder
-                .bucket(bucketName)
-                .key(key)
-                .uploadId(uploadId)
-                .multipartUpload(completedMultipartUpload)
-                .build()
-        }
+
+        CompleteMultipartUploadRequest.builder()
+            .bucket(bucketName)
+            .key(key)
+            .uploadId(uploadId)
+            .multipartUpload(completedMultipartUpload)
+            .build()
+            .let { s3Client.completeMultipartUpload(it) }
     }
 
     private fun cleanUp(s3Client: S3Client) {
         logger.info("cleaning up")
-        val multiPartUploads = s3Client.listMultipartUploads { builder ->
-            builder.bucket(bucketName).prefix("random-").build()
-        }.uploads()
+        val multiPartUploads = ListMultipartUploadsRequest.builder()
+            .bucket(bucketName)
+            .prefix("random-")
+            .build()
+            .let { s3Client.listMultipartUploads(it) }
+            .uploads()
 
         multiPartUploads.forEach { multiPartUpload ->
             logger.info("aborting multipart upload {}", multiPartUpload.key())
-            s3Client.abortMultipartUpload { builder ->
-                builder.bucket(bucketName).uploadId(multiPartUpload.uploadId()).key(multiPartUpload.key()).build()
-            }
+            AbortMultipartUploadRequest.builder()
+                .bucket(bucketName)
+                .uploadId(multiPartUpload.uploadId())
+                .key(multiPartUpload.key())
+                .build()
+                .let { s3Client.abortMultipartUpload(it) }
         }
 
-        s3Client.deleteObject { deleteObjectRequestBuilder ->
-            deleteObjectRequestBuilder.bucket(bucketName).key(key).build()
-        }
+        DeleteObjectRequest.builder()
+            .bucket(bucketName)
+            .key(key)
+            .build()
+            .let { s3Client.deleteObject(it) }
     }
 }
