@@ -1,0 +1,14 @@
+version: '3'
+
+services:
+  localstack:
+    image: localstack/localstack-light:latest
+    # image: localstack/localstack-light:0.12.7
+    ports:
+      - '4566:4566'
+    environment:
+      SERVICES: s3
+      DEBUG: 1
+
+networks:
+  default:
