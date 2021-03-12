@@ -1,4 +1,6 @@
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertAll
 import org.slf4j.LoggerFactory
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider
@@ -19,16 +21,18 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 import java.time.Duration
+import java.time.Instant
 
-internal class LocalStackS3PresignTest {
+internal class LocalStackS3MultiPartPresignTest {
 
     companion object {
-        private const val bucketName = "hubindustrial-iq-files-test"
-        private val logger by lazy { LoggerFactory.getLogger(LocalStackS3PresignTest::class.java) }
+        private const val bucketName = "test-bucket"
+        private val key = "random-${Instant.now()}.bin"
+        private val logger = LoggerFactory.getLogger(LocalStackS3MultiPartPresignTest::class.java)
     }
 
     @Test
-    fun `test presign multipart using localstack`() {
+    fun `test presign multipart using localstack `() {
         val localstackEndpoint = URI("http://localstack:4566")
         val credentials = AwsBasicCredentials.create("test", "test")
         val credentialsProvider = StaticCredentialsProvider.create(credentials)
@@ -38,6 +42,7 @@ internal class LocalStackS3PresignTest {
             .endpointOverride(localstackEndpoint)
             .build()
 
+        // create bucket in localstack if it doesn't exist
         val bucketExists = s3Client.listBuckets().buckets().any { it.name() == bucketName }
         if (!bucketExists) {
             CreateBucketRequest.builder().bucket(bucketName).build().let { s3Client.createBucket(it) }
@@ -50,19 +55,28 @@ internal class LocalStackS3PresignTest {
 
         val (uploadId, presignedUrls) = presign(s3Client, s3Presigner)
         try {
-            val eTags = testPresignedUrls(presignedUrls)
+            val eTags = uploadPartsUsingPresignedUrls(presignedUrls)
             completeMultiPartUpload(uploadId, eTags, s3Client)
             val headObjectResponse = HeadObjectRequest
                 .builder()
                 .bucket(bucketName)
-                .key("random.bin")
+                .key(key)
                 .build()
                 .let { s3Client.headObject(it) }
 
-            assert(headObjectResponse.contentLength() == 12582912L)
-            assert(headObjectResponse.contentType() == "application/octet-stream")
+            val tags = s3Client.getObjectTagging { builder ->
+                builder.bucket(bucketName).key(key).build()
+            }.tagSet()
+            val tagPresent = tags.any { tag -> tag.key() == "key" && tag.value() == "value" }
+
+            assertAll(
+                { assertTrue(headObjectResponse.contentLength() == 12582912L) { "content-length" } },
+                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { " content-type" } },
+                // this assertion fails using localstack:0.12.7, but succeeds for real S3
+                { assertTrue(tagPresent, "tags should include 'key=value'; found: $tags") }
+            )
         } finally {
-            deleteFile(s3Client)
+            cleanUp(s3Client)
         }
     }
 
@@ -76,28 +90,42 @@ internal class LocalStackS3PresignTest {
         // set sys prop aws.profile or env var AWS_PROFILE to use non-default profile from ~/.aws/credentials or
         // set sys prop aws.sharedCredentialsFile or env var AWS_SHARED_CREDENTIALS_FILE to use a different file
         val credentialsProvider = DefaultCredentialsProvider.create()
+        logger.info("using AWS access key {}", credentialsProvider.resolveCredentials().accessKeyId())
+
         val s3Client = S3Client.builder()
             .credentialsProvider(credentialsProvider)
             .build()
+
         val s3Presigner = S3Presigner.builder()
             .credentialsProvider(credentialsProvider)
             .build()
 
+        val bucketExists = s3Client.listBuckets().buckets().any { it.name() == bucketName }
+        assert(bucketExists) { "bucket $bucketName does not exist in S3, please create it" }
+
         val (uploadId, presignedUrls) = presign(s3Client, s3Presigner)
         try {
-            val eTags = testPresignedUrls(presignedUrls)
+            val eTags = uploadPartsUsingPresignedUrls(presignedUrls)
             completeMultiPartUpload(uploadId, eTags, s3Client)
             val headObjectResponse = HeadObjectRequest
                 .builder()
                 .bucket(bucketName)
-                .key("random.bin")
+                .key(key)
                 .build()
                 .let { s3Client.headObject(it) }
-            assert(headObjectResponse.contentLength() == 12582912L)
-            assert(headObjectResponse.contentType() == "application/octet-stream")
-            assert(headObjectResponse.partsCount() == 2)
+
+            val tags = s3Client.getObjectTagging { builder ->
+                builder.bucket(bucketName).key(key).build()
+            }.tagSet()
+            val tagPresent = tags.any { tag -> tag.key() == "key" && tag.value() == "value" }
+
+            assertAll(
+                { assertTrue(headObjectResponse.contentLength() == 12582912L) { "content-length" } },
+                { assertTrue(headObjectResponse.contentType() == "application/octet-stream") { " content-type" } },
+                { assertTrue(tagPresent, "tags should include 'key=value'; found: $tags") }
+            )
         } finally {
-            deleteFile(s3Client)
+            cleanUp(s3Client)
         }
     }
 
@@ -108,7 +136,7 @@ internal class LocalStackS3PresignTest {
         val uploadId = CreateMultipartUploadRequest.builder()
             .bucket(bucketName)
             .contentType("application/octet-stream")
-            .key("random.bin")
+            .key(key)
             .tagging(tags)
             .build()
             .let { s3Client.createMultipartUpload(it) }
@@ -117,7 +145,7 @@ internal class LocalStackS3PresignTest {
         val urls = (1..2).map { partNumber ->
             val uploadPartRequest = UploadPartRequest.builder()
                 .bucket(bucketName)
-                .key("random.bin")
+                .key(key)
                 .partNumber(partNumber)
                 .uploadId(uploadId)
                 .build()
@@ -127,12 +155,15 @@ internal class LocalStackS3PresignTest {
                 .uploadPartRequest(uploadPartRequest)
                 .build()
 
-            s3Presigner.presignUploadPart(presignRequest).url()
+            val presignedUploadPartRequest = s3Presigner.presignUploadPart(presignRequest)
+            logger.info("presigned url: {}", presignedUploadPartRequest.url())
+            logger.info("signed headers: {}", presignedUploadPartRequest.signedHeaders())
+            presignedUploadPartRequest.url()
         }
         return uploadId to urls
     }
 
-    private fun testPresignedUrls(presignedUrls: List<URL>): Map<Int, String> {
+    private fun uploadPartsUsingPresignedUrls(presignedUrls: List<URL>): Map<Int, String> {
         // random.bin was generated w/ "dd if=/dev/urandom of=random.bin bs=4096 count=3072"
         val file = RandomAccessFile("src/test/resources/random.bin", "r")
         val size = file.length().toInt()
@@ -159,15 +190,16 @@ internal class LocalStackS3PresignTest {
         connection.requestMethod = "PUT"
         connection.doOutput = true
         connection.addRequestProperty("content-type", "application/octet-stream")
-        // both localstack:latest and localstack:0.12.7 fail w/ this header, but S3 does not
-        // this header is required to be present to have the correct tags on the object after all parts have been uploaded
-        connection.addRequestProperty("x-amz-tagging", "key=value")
         connection.outputStream.use { outputStream ->
             outputStream.write(bytes)
             outputStream.flush()
         }
+        // upload fails signature validation using localstack:latest (as of 2021-03-12)
+        // upload succeeds using localstack:0.12.7
         logger.info("response: {}", connection.responseCode)
-        connection.headerFields.forEach { (name, value) -> logger.info("header {} = {}", name, value) }
+        connection.headerFields
+            .filter { (name, value) -> name != null && value != null }
+            .forEach { (name, value) -> logger.info("header {} = {}", name, value) }
         return connection.getHeaderField("Etag")
     }
 
@@ -181,16 +213,28 @@ internal class LocalStackS3PresignTest {
         s3Client.completeMultipartUpload { completeMultiPartUploadRequestBuilder ->
             completeMultiPartUploadRequestBuilder
                 .bucket(bucketName)
-                .key("random.bin")
+                .key(key)
                 .uploadId(uploadId)
                 .multipartUpload(completedMultipartUpload)
                 .build()
         }
     }
 
-    private fun deleteFile(s3Client: S3Client) {
+    private fun cleanUp(s3Client: S3Client) {
+        logger.info("cleaning up")
+        val multiPartUploads = s3Client.listMultipartUploads { builder ->
+            builder.bucket(bucketName).prefix("random-").build()
+        }.uploads()
+
+        multiPartUploads.forEach { multiPartUpload ->
+            logger.info("aborting multipart upload {}", multiPartUpload.key())
+            s3Client.abortMultipartUpload { builder ->
+                builder.bucket(bucketName).uploadId(multiPartUpload.uploadId()).key(multiPartUpload.key()).build()
+            }
+        }
+
         s3Client.deleteObject { deleteObjectRequestBuilder ->
-            deleteObjectRequestBuilder.bucket(bucketName).key("key").build()
+            deleteObjectRequestBuilder.bucket(bucketName).key(key).build()
         }
     }
 }
