@@ -6,4 +6,4 @@
 * change localstack image in docker-compose.yml from latest to 0.12.7
 * start localstack w/ "docker-compose -f docker-compose.yml up"
 * run test w/ "./gradlew check"
-* localstack test will fail due to missing tag, localstack test w/ tagging will fail
+* localstack test will fail due to missing tag, S3 test will pass
