@@ -38,7 +38,7 @@ internal class LocalStackS3MultiPartPresignTest {
 
     @Test
     fun `test presign multipart using localstack `() {
-        val localstackEndpoint = URI("http://localstack:4566")
+        val localstackEndpoint = URI("http://127.0.0.1:4566")
         val credentials = AwsBasicCredentials.create("test", "test")
         val credentialsProvider = StaticCredentialsProvider.create(credentials)
 
